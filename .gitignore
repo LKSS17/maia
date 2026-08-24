@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Environment & Credentials
+.env
+*.pem
+*.key
+client_secret*.json
+credentials.json
+token.json
+
+# Database
+*.db
+*.sqlite3
+
+# Logs & Temp
+logs/
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.spec
