@@ -29,3 +29,5 @@ htmlcov/
 dist/
 build/
 *.spec
+*.db-shm
+*.db-wal
