@@ -1,4 +1,4 @@
-"""Serviço de consulta de ações com brapi, resolução cadastral CVM e cache em memória."""
+"""Serviço de consulta de ações com brapi, resolução cadastral CVM e tratamento estrito de conectividade."""
 
 import re
 import requests
@@ -11,7 +11,6 @@ from backend.app.core.logging import logger
 from backend.app.services.stocks_dto import StockQuoteResult, StockSearchResult
 
 
-# Base cadastral de referência oficial para as principais companhias abertas listadas na B3
 CVM_OFFICIAL_REGISTRY: Dict[str, str] = {
     "PETR3": "33.000.167/0001-01",
     "PETR4": "33.000.167/0001-01",
@@ -43,10 +42,9 @@ class StocksService:
         return headers
 
     def resolve_cnpj(self, ticker: str, stock_data: Optional[Dict[str, Any]] = None) -> Optional[str]:
-        """Resolve CNPJ dinamicamente a partir de metadados da API ou do cadastro de referência CVM."""
+        """Resolve CNPJ a partir do payload da API ou do cadastro de referência oficial CVM."""
         clean_ticker = ticker.upper().strip()
 
-        # 1. Se vier diretamente na resposta da API externa
         if stock_data:
             if stock_data.get("cnpj"):
                 return stock_data["cnpj"]
@@ -54,11 +52,10 @@ class StocksService:
             if summary.get("taxId"):
                 return summary["taxId"]
 
-        # 2. Resolução da base cadastral CVM de referência
         return CVM_OFFICIAL_REGISTRY.get(clean_ticker)
 
     def get_stock_quote(self, ticker: str) -> StockQuoteResult:
-        """Busca cotação por ticker com cache TTL."""
+        """Busca cotação por ticker com cache TTL. Lança ValueError se a rede falhar ou o ativo não existir."""
         clean_ticker = ticker.upper().strip()
 
         if clean_ticker in self._cache:
@@ -98,17 +95,8 @@ class StocksService:
             return quote_result
 
         except requests.exceptions.RequestException as e:
-            logger.error(f"Erro ao consultar brapi para '{clean_ticker}': {str(e)}")
-            # Fallback seguro para mock/ambiente de teste offline
-            cnpj = self.resolve_cnpj(clean_ticker)
-            return StockQuoteResult(
-                ticker=clean_ticker,
-                nome_empresa=clean_ticker,
-                cnpj=cnpj,
-                preco_atual=Decimal("0.00"),
-                variacao_dia=Decimal("0.00"),
-                data_hora_consulta=datetime.now()
-            )
+            logger.error(f"Erro de conexão ao consultar brapi para '{clean_ticker}': {str(e)}")
+            raise ValueError(f"Não foi possível buscar a cotação de {clean_ticker}. Verifique sua conexão com a internet.")
 
     def search_by_name_or_ticker(self, term: str) -> StockSearchResult:
         clean_term = term.strip().upper()

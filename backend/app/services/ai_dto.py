@@ -1,19 +1,18 @@
-"""Esquema de dados para inferência contábil via LLM."""
+"""Data Transfer Objects para interação estruturada com o classificador Gemini."""
 
 from typing import List, Optional
-from decimal import Decimal
 from pydantic import BaseModel, Field
 
 
 class AIClassificationItem(BaseModel):
-    """Classificação sugerida pela IA para uma transação individual."""
-    transacao_id: int
-    numero_conta: str
-    conta_id: int
-    confianca: Decimal = Field(..., ge=Decimal("0.0"), le=Decimal("1.0"))
-    justificativa: str
+    index: int = Field(..., description="Índice da transação correspondente no lote")
+    conta_id: Optional[int] = Field(None, description="ID da conta contábil correspondente")
+    confianca: float = Field(..., description="Nível de confiança entre 0.0 e 1.0")
+    justificativa: str = Field(..., description="Justificativa contábil para a classificação")
 
 
 class AIBatchResponse(BaseModel):
-    """Lote de classificações retornado pela IA."""
-    classificacoes: List[AIClassificationItem]
+    classificacoes: List[AIClassificationItem] = Field(
+        default_factory=list,
+        description="Lista de classificações geradas para o lote"
+    )

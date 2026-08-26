@@ -3,12 +3,12 @@
 import os
 from pathlib import Path
 from pydantic_settings import BaseSettings
-from platformdirs import user_data_dir, user_log_dir
+from platformdirs import user_data_dir
 
 
 def get_app_data_dir() -> Path:
     """Garante e retorna o diretório de dados do usuário."""
-    path = Path(user_data_dir(appname="MAIA", appauthor="MAIA"))
+    path = Path(user_data_dir(appname="MAIA", appauthor=None))
     try:
         path.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -27,7 +27,6 @@ class Settings(BaseSettings):
     APP_ENV: str = "production"
     ENVIRONMENT: str = "production"
     
-    # Armazenamento SQLite fora da pasta de instalação binária
     DATABASE_URL: str = f"sqlite:///{DEFAULT_DB_PATH.as_posix()}"
     
     GEMINI_API_KEY: str = ""
