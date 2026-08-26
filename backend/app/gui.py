@@ -1,4 +1,4 @@
-"""Interface Desktop do MAIA desenvolvida com CustomTkinter."""
+"""Interface Desktop do MAIA desenvolvida com CustomTkinter (Thread-Safe e Isolamento de DB)."""
 
 import os
 import threading
@@ -6,7 +6,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 from backend.app.db.session import SessionLocal, Base, engine
-from backend.app.models.entities import Cliente, PlanoContas
+from backend.app.models.entities import Cliente
 from backend.app.services.ingestion import StatementIngestionService
 from backend.app.services.rules_engine import RulesEngineService
 from backend.app.services.ai_classifier import GeminiClassifierService
@@ -27,13 +27,13 @@ class MaiaApp(ctk.CTk):
         self.geometry("980x680")
         self.minsize(850, 550)
 
-        # Inicializar banco de dados local automaticamente
+        # Garantir tabelas
         Base.metadata.create_all(bind=engine)
-        self.db = SessionLocal()
 
+        # Serviços de ciclo de vida contínuo (cache preservado)
         self.spreadsheet_service = SpreadsheetGeneratorService()
         self.stocks_service = StocksService()
-        self.review_service = ReviewService(self.db)
+        self.ai_classifier = GeminiClassifierService()
 
         # Layout Principal com Abas
         self.tabview = ctk.CTkTabview(self)
@@ -49,6 +49,23 @@ class MaiaApp(ctk.CTk):
         self._setup_acoes_tab()
         self._setup_config_tab()
 
+    # ==================== HELPERS THREAD-SAFE ====================
+    def _ui_log(self, text: str):
+        self.after(0, lambda: self._append_log(text))
+
+    def _append_log(self, text: str):
+        self.txt_log.insert("end", text + "\n")
+        self.txt_log.see("end")
+
+    def _ui_set_btn_state(self, state: str):
+        self.after(0, lambda: self.btn_process.configure(state=state))
+
+    def _ui_show_info(self, title: str, msg: str):
+        self.after(0, lambda: messagebox.showinfo(title, msg))
+
+    def _ui_show_error(self, title: str, msg: str):
+        self.after(0, lambda: messagebox.showerror(title, msg))
+
     # ==================== ABA 1: CONCILIAÇÃO ====================
     def _setup_conciliacao_tab(self):
         frame = self.tab_conciliacao
@@ -56,7 +73,6 @@ class MaiaApp(ctk.CTk):
         lbl_title = ctk.CTkLabel(frame, text="Processamento de Extratos Bancários", font=ctk.CTkFont(size=18, weight="bold"))
         lbl_title.pack(anchor="w", padx=10, pady=(5, 15))
 
-        # Seleção de Cliente
         client_frame = ctk.CTkFrame(frame)
         client_frame.pack(fill="x", padx=10, pady=5)
 
@@ -68,7 +84,6 @@ class MaiaApp(ctk.CTk):
         btn_reload = ctk.CTkButton(client_frame, text="Atualizar Lista", width=120, command=self._refresh_clients)
         btn_reload.pack(side="left", padx=5)
 
-        # Upload e Arquivo
         file_frame = ctk.CTkFrame(frame)
         file_frame.pack(fill="x", padx=10, pady=10)
 
@@ -79,7 +94,6 @@ class MaiaApp(ctk.CTk):
         btn_select = ctk.CTkButton(file_frame, text="Selecionar Extrato", command=self._select_file)
         btn_select.pack(side="right", padx=10, pady=10)
 
-        # Ação Principal
         self.btn_process = ctk.CTkButton(
             frame,
             text="Processar e Classificar com MAIA",
@@ -89,14 +103,14 @@ class MaiaApp(ctk.CTk):
         )
         self.btn_process.pack(fill="x", padx=10, pady=15)
 
-        # Log visual de status
         self.txt_log = ctk.CTkTextbox(frame, height=220)
         self.txt_log.pack(fill="both", expand=True, padx=10, pady=5)
         self.txt_log.insert("end", "Pronto para processar extratos.\n")
 
     def _get_client_names(self):
-        clients = self.db.query(Cliente).all()
-        return [f"{c.id} - {c.nome}" for c in clients] or ["Nenhum cliente cadastrado"]
+        with SessionLocal() as db:
+            clients = db.query(Cliente).all()
+            return [f"{c.id} - {c.nome}" for c in clients] or ["Nenhum cliente cadastrado"]
 
     def _refresh_clients(self):
         names = self._get_client_names()
@@ -110,10 +124,6 @@ class MaiaApp(ctk.CTk):
             self.selected_file_path = path
             self.lbl_selected_file.configure(text=os.path.basename(path))
 
-    def _log(self, text: str):
-        self.txt_log.insert("end", text + "\n")
-        self.txt_log.see("end")
-
     def _process_statement_flow(self):
         if not self.selected_file_path:
             messagebox.showwarning("Aviso", "Por favor, selecione um arquivo de extrato primeiro.")
@@ -125,51 +135,48 @@ class MaiaApp(ctk.CTk):
             return
 
         client_id = int(client_str.split(" - ")[0])
+        file_path = self.selected_file_path
 
         def run_task():
-            try:
-                self.btn_process.configure(state="disabled")
-                self._log(f"Iniciando leitura de {os.path.basename(self.selected_file_path)}...")
+            with SessionLocal() as db:
+                try:
+                    self._ui_set_btn_state("disabled")
+                    self._ui_log(f"Iniciando leitura de {os.path.basename(file_path)}...")
 
-                with open(self.selected_file_path, "rb") as f:
-                    content = f.read()
+                    with open(file_path, "rb") as f:
+                        content = f.read()
 
-                # Ingestão
-                ingestion_svc = StatementIngestionService(self.db)
-                extrato, txs = ingestion_svc.ingest_statement(client_id, os.path.basename(self.selected_file_path), content)
-                self._log(f"Ingestão concluída: {len(txs)} transações importadas.")
+                    ingestion_svc = StatementIngestionService(db)
+                    extrato, txs = ingestion_svc.ingest_statement(client_id, os.path.basename(file_path), content)
+                    self._ui_log(f"Ingestão concluída: {len(txs)} transações importadas.")
 
-                # Regras
-                rules_engine = RulesEngineService(self.db)
-                pendentes_ia = []
-                for t in txs:
-                    rules_engine.classify_transaction(t)
-                    if t.status_revisao.value == "pendente":
-                        pendentes_ia.append(t)
+                    rules_engine = RulesEngineService(db)
+                    pendentes_ia = []
+                    for t in txs:
+                        rules_engine.classify_transaction(t)
+                        if t.status_revisao.value == "pendente":
+                            pendentes_ia.append(t)
 
-                self._log(f"Cascata de Regras aplicada. {len(txs) - len(pendentes_ia)} itens classificados.")
+                    self._ui_log(f"Cascata de Regras aplicada. {len(txs) - len(pendentes_ia)} itens classificados.")
 
-                # IA Gemini para residuais
-                if pendentes_ia:
-                    self._log(f"Consultando IA para {len(pendentes_ia)} transações residuais...")
-                    gemini_svc = GeminiClassifierService(self.db)
-                    gemini_svc.classify_batch(client_id, pendentes_ia)
+                    if pendentes_ia:
+                        self._ui_log(f"Consultando IA para {len(pendentes_ia)} transações residuais...")
+                        self.ai_classifier.classify_batch(db, client_id, pendentes_ia)
 
-                # Gerar Planilha
-                client = self.db.query(Cliente).filter(Cliente.id == client_id).first()
-                out_name = self.spreadsheet_service.get_default_filename(client.nome)
-                save_path = os.path.join(os.path.expanduser("~"), out_name)
-                self.spreadsheet_service.generate_file(txs, save_path, client=client)
+                    client = db.query(Cliente).filter(Cliente.id == client_id).first()
+                    out_name = self.spreadsheet_service.get_default_filename(client.nome)
+                    save_path = os.path.join(os.path.expanduser("~"), out_name)
+                    self.spreadsheet_service.generate_file(txs, save_path, cliente=client)
 
-                self._log(f"Planilha de conciliação gerada com sucesso em:\n{save_path}")
-                messagebox.showinfo("Sucesso", f"Processamento concluído!\nPlanilha gerada: {out_name}")
-                self._load_pending_review_table()
+                    self._ui_log(f"Planilha de conciliação gerada com sucesso em:\n{save_path}")
+                    self._ui_show_info("Sucesso", f"Processamento concluído!\nPlanilha gerada: {out_name}")
+                    self.after(0, self._load_pending_review_table)
 
-            except Exception as e:
-                self._log(f"Erro durante o processamento: {str(e)}")
-                messagebox.showerror("Erro", f"Não foi possível concluir o processamento:\n{str(e)}")
-            finally:
-                self.btn_process.configure(state="normal")
+                except Exception as e:
+                    self._ui_log(f"Erro durante o processamento: {str(e)}")
+                    self._ui_show_error("Erro", f"Não foi possível concluir o processamento:\n{str(e)}")
+                finally:
+                    self._ui_set_btn_state("normal")
 
         threading.Thread(target=run_task, daemon=True).start()
 
@@ -205,17 +212,20 @@ class MaiaApp(ctk.CTk):
             return
 
         client_id = int(client_str.split(" - ")[0])
-        items = self.review_service.get_pending_review_items(client_id)
 
-        self.review_box.delete("1.0", "end")
-        if not items:
-            self.review_box.insert("end", "Nenhuma transação pendente de revisão para este cliente.\n")
-            return
+        with SessionLocal() as db:
+            review_service = ReviewService(db)
+            items = review_service.get_pending_review_items(client_id)
 
-        self.review_box.insert("end", f"{'ID':<6} | {'Data':<10} | {'Valor (R$)':<12} | {'Confiança':<10} | {'Histórico Bancário'}\n")
-        self.review_box.insert("end", "-" * 85 + "\n")
-        for it in items:
-            self.review_box.insert("end", f"{it.id:<6} | {it.data.strftime('%d/%m/%Y')} | {it.valor:<12.2f} | {it.nivel_confianca:<10} | {it.descricao_banco}\n")
+            self.review_box.delete("1.0", "end")
+            if not items:
+                self.review_box.insert("end", "Nenhuma transação pendente de revisão para este cliente.\n")
+                return
+
+            self.review_box.insert("end", f"{'ID':<6} | {'Data':<10} | {'Valor (R$)':<12} | {'Confiança':<10} | {'Histórico Bancário'}\n")
+            self.review_box.insert("end", "-" * 85 + "\n")
+            for it in items:
+                self.review_box.insert("end", f"{it.id:<6} | {it.data.strftime('%d/%m/%Y')} | {it.valor:<12.2f} | {it.nivel_confianca:<10} | {it.descricao_banco}\n")
 
     def _apply_correction(self):
         tx_id_str = self.ent_tx_id.get().strip()
@@ -225,19 +235,21 @@ class MaiaApp(ctk.CTk):
             messagebox.showwarning("Aviso", "Preencha o ID da Transação e o ID da Conta.")
             return
 
-        try:
-            req = ManualCorrectionRequest(
-                transacao_id=int(tx_id_str),
-                nova_conta_id=int(acc_id_str),
-                salvar_como_regra=True
-            )
-            self.review_service.correct_manually(req)
-            messagebox.showinfo("Sucesso", "Transação revisada e nova regra aprendida pelo MAIA!")
-            self._load_pending_review_table()
-            self.ent_tx_id.delete(0, "end")
-            self.ent_account_id.delete(0, "end")
-        except Exception as e:
-            messagebox.showerror("Erro", f"Falha na revisão: {str(e)}")
+        with SessionLocal() as db:
+            try:
+                review_service = ReviewService(db)
+                req = ManualCorrectionRequest(
+                    transacao_id=int(tx_id_str),
+                    nova_conta_id=int(acc_id_str),
+                    salvar_como_regra=True
+                )
+                review_service.correct_manually(req)
+                messagebox.showinfo("Sucesso", "Transação revisada e nova regra aprendida pelo MAIA!")
+                self._load_pending_review_table()
+                self.ent_tx_id.delete(0, "end")
+                self.ent_account_id.delete(0, "end")
+            except Exception as e:
+                messagebox.showerror("Erro", f"Falha na revisão: {str(e)}")
 
     # ==================== ABA 3: CONSULTA DE AÇÕES ====================
     def _setup_acoes_tab(self):
@@ -267,21 +279,26 @@ class MaiaApp(ctk.CTk):
         def run_search():
             try:
                 res = self.stocks_service.search_by_name_or_ticker(term)
-                self.txt_stock_result.delete("1.0", "end")
-                if not res.resultados:
-                    self.txt_stock_result.insert("end", f"Nenhuma cotação encontrada para '{term}'.\n")
-                    return
 
-                for q in res.resultados:
-                    self.txt_stock_result.insert("end", f"Ticker: {q.ticker}\n")
-                    self.txt_stock_result.insert("end", f"Empresa: {q.nome_empresa}\n")
-                    self.txt_stock_result.insert("end", f"CNPJ Oficial (CVM): {q.cnpj or 'Não mapeado'}\n")
-                    self.txt_stock_result.insert("end", f"Preço Atual: R$ {q.preco_atual:.2f}\n")
-                    self.txt_stock_result.insert("end", f"Variação Dia: {q.variacao_dia}%\n")
-                    self.txt_stock_result.insert("end", f"Data/Hora Consulta: {q.data_hora_consulta.strftime('%d/%m/%Y %H:%M:%S')}\n")
-                    self.txt_stock_result.insert("end", "-" * 60 + "\n\n")
+                def update_result_ui():
+                    self.txt_stock_result.delete("1.0", "end")
+                    if not res.resultados:
+                        self.txt_stock_result.insert("end", f"Nenhuma cotação encontrada para '{term}'.\n")
+                        return
+
+                    for q in res.resultados:
+                        self.txt_stock_result.insert("end", f"Ticker: {q.ticker}\n")
+                        self.txt_stock_result.insert("end", f"Empresa: {q.nome_empresa}\n")
+                        self.txt_stock_result.insert("end", f"CNPJ Oficial (CVM): {q.cnpj or 'Não mapeado'}\n")
+                        self.txt_stock_result.insert("end", f"Preço Atual: R$ {q.preco_atual:.2f}\n")
+                        self.txt_stock_result.insert("end", f"Variação Dia: {q.variacao_dia}%\n")
+                        self.txt_stock_result.insert("end", f"Data/Hora Consulta: {q.data_hora_consulta.strftime('%d/%m/%Y %H:%M:%S')}\n")
+                        self.txt_stock_result.insert("end", "-" * 60 + "\n\n")
+
+                self.after(0, update_result_ui)
+
             except Exception as e:
-                self.txt_stock_result.insert("end", f"Erro na consulta: {str(e)}\n")
+                self.after(0, lambda: self.txt_stock_result.insert("end", f"Erro na consulta: {str(e)}\n"))
 
         threading.Thread(target=run_search, daemon=True).start()
 

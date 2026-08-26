@@ -1,10 +1,9 @@
 """Gerenciamento de criptografia segura em repouso para credenciais e tokens OAuth."""
 
-import base64
-import os
 from pathlib import Path
 from cryptography.fernet import Fernet
-from backend.app.core.config import settings
+from backend.app.core.config import settings, APP_DATA_DIR
+from backend.app.core.logging import logger
 
 
 class TokenVault:
@@ -16,12 +15,18 @@ class TokenVault:
         elif settings.ENCRYPTION_KEY:
             self.fernet = Fernet(settings.ENCRYPTION_KEY.encode())
         else:
-            # Fallback seguro para desenvolvimento: arquivo de chave local
-            key_file = Path("logs/.vault_key")
+            # Armazena em diretório protegido do usuário, desacoplado de logs
+            vault_dir = APP_DATA_DIR / "vault"
+            vault_dir.mkdir(parents=True, exist_ok=True)
+            key_file = vault_dir / ".vault_key"
+            
             if not key_file.exists():
                 generated_key = Fernet.generate_key()
-                key_file.parent.mkdir(exist_ok=True)
                 key_file.write_bytes(generated_key)
+                logger.warning(
+                    "[SEGURANÇA] Nova chave mestra gerada em disco. "
+                    "Se este arquivo for apagado, tokens previamente criptografados não poderão ser recuperados."
+                )
             self.fernet = Fernet(key_file.read_bytes())
 
     def encrypt(self, plain_text: str) -> str:
@@ -34,7 +39,11 @@ class TokenVault:
         """Decriptografa dados protegidos."""
         if not cipher_text:
             return ""
-        return self.fernet.decrypt(cipher_text.encode("utf-8")).decode("utf-8")
+        try:
+            return self.fernet.decrypt(cipher_text.encode("utf-8")).decode("utf-8")
+        except Exception as e:
+            logger.error(f"[SEGURANÇA] Falha ao decriptografar token: chave inconsistente ou corrompida. {e}")
+            raise ValueError("Não foi possível decriptografar a credencial. A chave do vault pode ter sido alterada.")
 
 
 vault = TokenVault()

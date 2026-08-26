@@ -1,27 +1,45 @@
-"""Configuração de logs estruturados locais."""
+"""Configuração centralizada de logs estruturados."""
 
 import sys
 from pathlib import Path
 from loguru import logger
-from backend.app.core.config import settings
+from platformdirs import user_log_dir
 
-LOGS_DIR = Path("logs")
-LOGS_DIR.mkdir(exist_ok=True)
 
+def get_log_dir() -> Path:
+    log_path = Path(user_log_dir(appname="MAIA", appauthor="MAIA"))
+    try:
+        log_path.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        log_path = Path.home() / ".maia" / "logs"
+        log_path.mkdir(parents=True, exist_ok=True)
+    return log_path
+
+
+LOGS_DIR = get_log_dir()
+LOG_FILE = LOGS_DIR / "maia.log"
+
+# Remove sinks padrão
 logger.remove()
 
-logger.add(
-    sys.stdout,
-    level=settings.LOG_LEVEL,
-    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-)
+# Adiciona sink no console apenas se stdout estiver disponível (fora de modo windowed estrito)
+if sys.stdout is not None:
+    logger.add(
+        sys.stdout,
+        level="INFO",
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
+    )
 
-logger.add(
-    LOGS_DIR / "maia_{time:YYYY-MM-DD}.log",
-    rotation="10 MB",
-    retention="30 days",
-    compression="zip",
-    level=settings.LOG_LEVEL,
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-    encoding="utf-8",
-)
+# Sink persistente em arquivo de log de usuário
+try:
+    logger.add(
+        str(LOG_FILE),
+        rotation="10 MB",
+        retention="30 days",
+        level="DEBUG",
+        encoding="utf-8",
+        enqueue=True
+    )
+except Exception as e:
+    # Fallback seguro para evitar crash no import
+    pass

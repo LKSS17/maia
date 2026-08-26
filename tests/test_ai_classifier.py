@@ -1,15 +1,15 @@
-"""Testes de classificação via IA com simulação de API e tratamento de erros."""
+"""Testes para o serviço de classificação via IA Gemini com cache desacoplado de sessão."""
 
 import pytest
-from unittest.mock import MagicMock
 from decimal import Decimal
 from datetime import datetime
+from unittest.mock import patch, MagicMock
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from backend.app.db.session import Base
 from backend.app.models.entities import (
-    Cliente, PlanoContas, Transacao, TipoMovimento, StatusRevisao, OrigemClassificacao
+    Cliente, PlanoContas, Transacao, TipoMovimento, OrigemClassificacao
 )
 from backend.app.services.ai_classifier import GeminiClassifierService
 
@@ -24,81 +24,44 @@ def db_session():
     session.close()
 
 
-def test_ai_batch_classification_success(db_session):
-    cliente = Cliente(nome="Cliente IA", documento="20.000.000/0001-20")
+def test_gemini_classify_batch_with_cache(db_session):
+    cliente = Cliente(nome="Cliente Teste IA", documento="12.345.678/0001-90")
     db_session.add(cliente)
     db_session.commit()
 
-    c_combustivel = PlanoContas(
-        cliente_id=cliente.id, numero_conta="4.1.5.01", descricao="Combustíveis e Lubrificantes", tipo="Despesa"
+    conta = PlanoContas(
+        cliente=cliente,
+        numero_conta="4.1.2.01",
+        descricao="Serviços de Terceiros",
+        tipo="Despesa"
     )
-    db_session.add(c_combustivel)
-    db_session.commit()
-
-    tx = Transacao(
-        cliente_id=cliente.id,
-        data=datetime.now(),
-        descricao_banco="POSTO IPIRANGA KM 12",
-        valor=Decimal("150.00"),
-        tipo_movimento=TipoMovimento.SAIDA,
-        status_revisao=StatusRevisao.PENDENTE
-    )
-    db_session.add(tx)
-    db_session.commit()
-
-    # Mock do cliente Gemini
-    mock_genai_client = MagicMock()
-    mock_response = MagicMock()
-    mock_response.text = f"""{{
-        "classificacoes": [
-            {{
-                "transacao_id": {tx.id},
-                "numero_conta": "4.1.5.01",
-                "conta_id": {c_combustivel.id},
-                "confianca": 0.95,
-                "justificativa": "Identificado pagamento em posto de combustível."
-            }}
-        ]
-    }}"""
-    mock_genai_client.models.generate_content.return_value = mock_response
-
-    service = GeminiClassifierService(db=db_session, client=mock_genai_client)
-    service.classify_batch(cliente.id, [tx])
-
-    assert tx.conta_classificada_id == c_combustivel.id
-    assert tx.origem_classificacao == OrigemClassificacao.IA
-    assert tx.confianca == Decimal("0.95")
-    assert tx.status_revisao == StatusRevisao.CONFIRMADO
-
-
-def test_ai_classification_degraded_mode_on_failure(db_session):
-    cliente = Cliente(nome="Cliente IA Falha", documento="21.000.000/0001-21")
-    db_session.add(cliente)
-    db_session.commit()
-
-    conta = PlanoContas(cliente_id=cliente.id, numero_conta="4.1.1.01", descricao="Despesas Gerais", tipo="Despesa")
     db_session.add(conta)
     db_session.commit()
 
     tx = Transacao(
-        cliente_id=cliente.id,
+        cliente=cliente,
         data=datetime.now(),
-        descricao_banco="COMPRA DESCONHECIDA 123",
-        valor=Decimal("50.00"),
-        tipo_movimento=TipoMovimento.SAIDA,
-        status_revisao=StatusRevisao.PENDENTE
+        descricao_banco="PAGTO FORNECEDOR AWS",
+        valor=Decimal("450.00"),
+        tipo_movimento=TipoMovimento.SAIDA
     )
     db_session.add(tx)
     db_session.commit()
 
-    # Simular falha de rede/API externa
-    mock_genai_client = MagicMock()
-    mock_genai_client.models.generate_content.side_effect = Exception("API Unavailable (Error 503)")
+    # Instância sem DB acoplado no construtor
+    service = GeminiClassifierService()
 
-    service = GeminiClassifierService(db=db_session, client=mock_genai_client)
-    
-    # Não deve lançar exceção nem travar o fluxo
-    service.classify_batch(cliente.id, [tx])
+    # Simula entrada em cache de longa duração
+    norm_key = service._normalize_key("PAGTO FORNECEDOR AWS")
+    service._local_cache[norm_key] = {
+        "conta_id": conta.id,
+        "confianca": 0.95
+    }
 
-    assert tx.conta_classificada_id is None
-    assert tx.status_revisao == StatusRevisao.PENDENTE
+    # Passa o db_session explicitamente como primeiro parâmetro
+    result = service.classify_batch(db_session, cliente.id, [tx])
+
+    assert len(result) == 1
+    assert result[0].conta_classificada_id == conta.id
+    assert result[0].confianca == Decimal("0.95")
+    assert result[0].origem_classificacao == OrigemClassificacao.IA

@@ -7,6 +7,10 @@ import sys
 
 def build():
     print("Iniciando build do executável MAIA via PyInstaller...")
+    
+    # os.pathsep resolve para ';' no Windows e ':' no Linux/macOS
+    backend_data = f"{os.path.abspath('backend')}{os.pathsep}backend"
+
     cmd = [
         sys.executable,
         "-m",
@@ -15,12 +19,13 @@ def build():
         "--onedir",
         "--windowed",
         "--name", "MAIA",
-        "--add-data", f"{os.path.abspath('backend')}:backend",
+        "--add-data", backend_data,
         "--hidden-import", "customtkinter",
         "--hidden-import", "openpyxl",
         "--hidden-import", "ofxparse",
         "--hidden-import", "pdfplumber",
         "--hidden-import", "sqlalchemy",
+        "--hidden-import", "platformdirs",
         "backend/app/gui.py"
     ]
     subprocess.run(cmd, check=True)

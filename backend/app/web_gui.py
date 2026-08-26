@@ -9,7 +9,6 @@ from typing import Optional, List
 
 from fastapi import FastAPI, Request, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, StreamingResponse
-from fastapi.templating import Jinja2Templates
 import uvicorn
 
 from backend.app.db.session import SessionLocal, Base, engine
@@ -26,6 +25,11 @@ from backend.app.services.stocks_service import StocksService
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="MAIA")
+
+# Instâncias de serviços compartilhados
+ai_classifier = GeminiClassifierService()
+stocks_service = StocksService()
+spreadsheet_service = SpreadsheetGeneratorService()
 
 HTML_CONTENT = """
 <!DOCTYPE html>
@@ -214,8 +218,7 @@ def index():
 
 @app.post("/api/process")
 async def process_statement(file: UploadFile = File(...)):
-    db = SessionLocal()
-    try:
+    with SessionLocal() as db:
         content = await file.read()
         cliente = db.query(Cliente).first()
         if not cliente:
@@ -235,45 +238,34 @@ async def process_statement(file: UploadFile = File(...)):
                 pendentes_ia.append(t)
 
         if pendentes_ia:
-            gemini_svc = GeminiClassifierService(db)
-            gemini_svc.classify_batch(cliente.id, pendentes_ia)
+            ai_classifier.classify_batch(db, cliente.id, pendentes_ia)
 
-        gen = SpreadsheetGeneratorService()
-        out_name = gen.get_default_filename(cliente.nome)
+        out_name = spreadsheet_service.get_default_filename(cliente.nome)
         save_path = os.path.join(os.path.expanduser("~"), out_name)
-        gen.generate_file(txs, save_path, cliente=cliente)
+        spreadsheet_service.generate_file(txs, save_path, cliente=cliente)
 
         return {"filename": file.filename, "total": len(txs), "xlsx": save_path}
-    finally:
-        db.close()
 
 @app.get("/api/review/pending")
 def list_pending():
-    db = SessionLocal()
-    try:
+    with SessionLocal() as db:
         cliente = db.query(Cliente).first()
         if not cliente:
             return []
         svc = ReviewService(db)
         items = svc.get_pending_review_items(cliente.id)
         return [it.model_dump() for it in items]
-    finally:
-        db.close()
 
 @app.post("/api/review/approve/{tx_id}")
 def approve_tx(tx_id: int):
-    db = SessionLocal()
-    try:
+    with SessionLocal() as db:
         svc = ReviewService(db)
         tx = svc.approve_transaction(tx_id)
         return {"status": "ok", "id": tx.id}
-    finally:
-        db.close()
 
 @app.get("/api/stocks/search")
 def search_stocks(term: str):
-    svc = StocksService()
-    res = svc.search_by_name_or_ticker(term)
+    res = stocks_service.search_by_name_or_ticker(term)
     return res.model_dump()
 
 

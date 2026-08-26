@@ -1,26 +1,42 @@
-"""Módulo de configuração centralizada do sistema MAIA."""
+"""Configurações globais da aplicação MAIA com caminhos resilientes."""
 
 import os
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pathlib import Path
+from pydantic_settings import BaseSettings
+from platformdirs import user_data_dir, user_log_dir
+
+
+def get_app_data_dir() -> Path:
+    """Garante e retorna o diretório de dados do usuário."""
+    path = Path(user_data_dir(appname="MAIA", appauthor="MAIA"))
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        path = Path.home() / ".maia"
+        path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+APP_DATA_DIR = get_app_data_dir()
+DEFAULT_DB_PATH = APP_DATA_DIR / "maia.db"
 
 
 class Settings(BaseSettings):
-    """Configurações da aplicação carregadas de variáveis de ambiente."""
-
     APP_NAME: str = "MAIA"
-    APP_ENV: str = "development"
-    LOG_LEVEL: str = "INFO"
-    DATABASE_URL: str = "sqlite:///./maia.db"
+    PROJECT_NAME: str = "MAIA"
+    APP_ENV: str = "production"
+    ENVIRONMENT: str = "production"
     
-    GEMINI_API_KEY: str | None = None
-    BRAPI_API_KEY: str | None = None
-    ENCRYPTION_KEY: str | None = None
+    # Armazenamento SQLite fora da pasta de instalação binária
+    DATABASE_URL: str = f"sqlite:///{DEFAULT_DB_PATH.as_posix()}"
+    
+    GEMINI_API_KEY: str = ""
+    BRAPI_API_KEY: str = ""
+    ENCRYPTION_KEY: str = ""
 
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore"
-    )
+    class Config:
+        env_file = ".env"
+        extra = "ignore"
 
 
 settings = Settings()

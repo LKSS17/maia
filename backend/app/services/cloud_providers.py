@@ -6,38 +6,44 @@ from typing import Optional, Dict, Any
 import requests
 
 from backend.app.core.logging import logger
-from backend.app.core.security import vault
 
 
 class CloudStorageProvider(ABC):
-    """Interface padrão para operações em nuvem do MAIA."""
-
     @abstractmethod
     def upload_file(self, file_bytes: bytes, filename: str, folder_id: Optional[str] = None) -> Dict[str, Any]:
-        """Faz upload de arquivo diretamente da memória."""
         pass
 
     @abstractmethod
-    def create_folder(self, folder_name: str, parent_folder_id: Optional[str] = None) -> str:
-        """Cria uma pasta e retorna seu identificador único na nuvem."""
+    def get_or_create_folder(self, folder_name: str, parent_folder_id: Optional[str] = None) -> str:
         pass
 
     @abstractmethod
     def get_or_create_client_path(self, client_name: str, year: int, month: int) -> str:
-        """Garante a estrutura Clientes/[Nome]/[Ano]/[Mês]/ e retorna o folder_id final."""
         pass
 
 
 class GoogleDriveService(CloudStorageProvider):
-    """Implementação para Google Drive usando OAuth 2.0 e escopo restrito drive.file."""
-
     def __init__(self, service_resource=None):
         self.service = service_resource
 
-    def create_folder(self, folder_name: str, parent_folder_id: Optional[str] = None) -> str:
+    def get_or_create_folder(self, folder_name: str, parent_folder_id: Optional[str] = None) -> str:
+        """Busca se a pasta já existe. Se não existir, cria uma única vez."""
         if not self.service:
             raise ValueError("Google Drive não está autenticado.")
 
+        query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        if parent_folder_id:
+            query += f" and '{parent_folder_id}' in parents"
+
+        response = self.service.files().list(
+            q=query, spaces='drive', fields='files(id, name)'
+        ).execute()
+        files = response.get('files', [])
+
+        if files:
+            return files[0].get('id')
+
+        # Criação se não existir
         file_metadata = {
             "name": folder_name,
             "mimeType": "application/vnd.google-apps.folder",
@@ -77,17 +83,14 @@ class GoogleDriveService(CloudStorageProvider):
         }
 
     def get_or_create_client_path(self, client_name: str, year: int, month: int) -> str:
-        # Hierarquia: Clientes -> [Nome] -> [Ano] -> [Mês]
-        clientes_root_id = self.create_folder("Clientes")
-        client_dir_id = self.create_folder(client_name, parent_folder_id=clientes_root_id)
-        year_dir_id = self.create_folder(str(year), parent_folder_id=client_dir_id)
-        month_dir_id = self.create_folder(f"{month:02d}", parent_folder_id=year_dir_id)
+        clientes_root_id = self.get_or_create_folder("Clientes")
+        client_dir_id = self.get_or_create_folder(client_name, parent_folder_id=clientes_root_id)
+        year_dir_id = self.get_or_create_folder(str(year), parent_folder_id=client_dir_id)
+        month_dir_id = self.get_or_create_folder(f"{month:02d}", parent_folder_id=year_dir_id)
         return month_dir_id
 
 
 class OneDriveService(CloudStorageProvider):
-    """Implementação para Microsoft OneDrive via Microsoft Graph API."""
-
     def __init__(self, access_token: Optional[str] = None):
         self.access_token = access_token
         self.base_url = "https://graph.microsoft.com/v1.0"
@@ -100,19 +103,41 @@ class OneDriveService(CloudStorageProvider):
             "Content-Type": "application/json"
         }
 
-    def create_folder(self, folder_name: str, parent_folder_id: Optional[str] = None) -> str:
-        url = (
+    def get_or_create_folder(self, folder_name: str, parent_folder_id: Optional[str] = None) -> str:
+        """Verifica se o item filho existe antes de solicitar criação."""
+        list_url = (
             f"{self.base_url}/me/drive/items/{parent_folder_id}/children"
             if parent_folder_id else f"{self.base_url}/me/drive/root/children"
         )
+        
+        try:
+            res = requests.get(list_url, headers=self._headers(), timeout=10)
+            if res.status_code == 200:
+                items = res.json().get("value", [])
+                for item in items:
+                    if item.get("name") == folder_name and "folder" in item:
+                        return item.get("id")
+        except Exception:
+            pass
+
+        # Criação com conflictBehavior fail para garantir unicidade
         payload = {
             "name": folder_name,
             "folder": {},
-            "@microsoft.graph.conflictBehavior": "rename"
+            "@microsoft.graph.conflictBehavior": "fail"
         }
-        res = requests.post(url, headers=self._headers(), json=payload, timeout=15)
-        res.raise_for_status()
-        return res.json().get("id")
+        create_res = requests.post(list_url, headers=self._headers(), json=payload, timeout=15)
+        if create_res.status_code in (200, 201):
+            return create_res.json().get("id")
+        elif create_res.status_code == 409:
+            # Se conflitou por corrida, re-busca o ID
+            res = requests.get(list_url, headers=self._headers(), timeout=10)
+            for item in res.json().get("value", []):
+                if item.get("name") == folder_name:
+                    return item.get("id")
+
+        create_res.raise_for_status()
+        return create_res.json().get("id")
 
     def upload_file(self, file_bytes: bytes, filename: str, folder_id: Optional[str] = None) -> Dict[str, Any]:
         url = (
@@ -136,8 +161,8 @@ class OneDriveService(CloudStorageProvider):
         }
 
     def get_or_create_client_path(self, client_name: str, year: int, month: int) -> str:
-        clientes_root_id = self.create_folder("Clientes")
-        client_dir_id = self.create_folder(client_name, parent_folder_id=clientes_root_id)
-        year_dir_id = self.create_folder(str(year), parent_folder_id=client_dir_id)
-        month_dir_id = self.create_folder(f"{month:02d}", parent_folder_id=year_dir_id)
+        clientes_root_id = self.get_or_create_folder("Clientes")
+        client_dir_id = self.get_or_create_folder(client_name, parent_folder_id=clientes_root_id)
+        year_dir_id = self.get_or_create_folder(str(year), parent_folder_id=client_dir_id)
+        month_dir_id = self.get_or_create_folder(f"{month:02d}", parent_folder_id=year_dir_id)
         return month_dir_id
