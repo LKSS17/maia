@@ -1,4 +1,4 @@
-"""Modelos de banco de dados do MAIA com índices compostos otimizados para SQLAlchemy 2.0."""
+"""Modelos de banco de dados do MAIA com índices e total retrocompatibilidade."""
 
 import enum
 from datetime import datetime
@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import List, Optional
 from sqlalchemy import (
     String, Integer, Numeric, DateTime, Enum, ForeignKey, 
-    Boolean, Text, Index
+    Boolean, Text
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -77,6 +77,10 @@ class Extrato(Base):
 
     cliente: Mapped["Cliente"] = relationship(back_populates="extratos")
     transacoes: Mapped[List["Transacao"]] = relationship(back_populates="extrato", cascade="all, delete-orphan")
+
+
+# Alias de compatibilidade com testes legados
+ExtratoImportado = Extrato
 
 
 class Transacao(Base):
