@@ -1,4 +1,4 @@
-"""Serviço de Ingestão de Extratos com persistência em lote e deduplicação estrita."""
+"""Serviço de Ingestão de Extratos com persistência em lote e deduplicação SHA-256."""
 
 import hashlib
 from typing import List, Tuple
@@ -6,8 +6,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.models.entities import Extrato, Transacao
 from backend.app.repositories.extrato_repository import ExtratoRepository
-from backend.app.services.parsers import OFXParser, CSVParser, PDFParser
-from backend.app.services.parser_dto import StatementParseResult
+from backend.app.services.parsers import OFXParser, CSVParser, PDFParser, StatementParseResult
 
 
 class StatementIngestionService:
@@ -38,7 +37,7 @@ class StatementIngestionService:
         if not parse_result.transacoes:
             raise ValueError("Nenhuma transação válida encontrada no arquivo fornecido.")
 
-        # Cria cabeçalho do extrato
+        # Cabeçalho do Extrato
         extrato = Extrato(
             cliente_id=cliente_id,
             nome_arquivo=filename,
@@ -46,9 +45,9 @@ class StatementIngestionService:
             total_transacoes=len(parse_result.transacoes)
         )
         self.db.add(extrato)
-        self.db.flush()  # Obtém extrato.id sem fechar a transação
+        self.db.flush()
 
-        # Inserção em lote (Batch Insert)
+        # Inserção em lote (Batch)
         tx_entities: List[Transacao] = []
         for item in parse_result.transacoes:
             tx = Transacao(
@@ -65,7 +64,6 @@ class StatementIngestionService:
         self.db.add_all(tx_entities)
         self.db.commit()
 
-        # Recarrega IDs com flush
         for tx in tx_entities:
             self.db.refresh(tx)
 
