@@ -1,4 +1,4 @@
-"""Modelos de banco de dados do MAIA com índices compostos otimizados."""
+"""Modelos de banco de dados do MAIA com índices compostos otimizados para SQLAlchemy 2.0."""
 
 import enum
 from datetime import datetime
@@ -6,9 +6,9 @@ from decimal import Decimal
 from typing import List, Optional
 from sqlalchemy import (
     String, Integer, Numeric, DateTime, Enum, ForeignKey, 
-    Boolean, Text, UniqueConstraint, Index
+    Boolean, Text, Index
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.db.session import Base
 
@@ -83,9 +83,9 @@ class Transacao(Base):
     __tablename__ = "transacoes"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    cliente_id: Mapped[int] = mapped_column(Integer, ForeignKey("clientes.id"), nullable=False)
+    cliente_id: Mapped[int] = mapped_column(Integer, ForeignKey("clientes.id"), nullable=False, index=True)
     extrato_id: Mapped[int] = mapped_column(Integer, ForeignKey("extratos.id"), nullable=False)
-    data: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    data: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
     descricao_banco: Mapped[str] = mapped_column(String(500), nullable=False)
     documento: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     valor: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
@@ -97,7 +97,7 @@ class Transacao(Base):
     )
     confianca: Mapped[Decimal] = mapped_column(Numeric(3, 2), default=Decimal("0.00"))
     status_revisao: Mapped[StatusRevisao] = mapped_column(
-        Enum(StatusRevisao), default=StatusRevisao.PENDENTE
+        Enum(StatusRevisao), default=StatusRevisao.PENDENTE, index=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -105,17 +105,12 @@ class Transacao(Base):
     extrato: Mapped["Extrato"] = relationship(back_populates="transacoes")
     conta_classificada: Mapped[Optional["PlanoContas"]] = relationship(back_populates="transacoes")
 
-    __table_args__ = (
-        Index("idx_transacao_cliente_status", "cliente_id", "status_revisao"),
-        Index("idx_transacao_cliente_data", "cliente_id", "data"),
-    )
-
 
 class RegraClassificacao(Base):
     __tablename__ = "regras_classificacao"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    cliente_id: Mapped[int] = mapped_column(Integer, ForeignKey("clientes.id"), nullable=False)
+    cliente_id: Mapped[int] = mapped_column(Integer, ForeignKey("clientes.id"), nullable=False, index=True)
     criterio: Mapped[CriterioRegra] = mapped_column(Enum(CriterioRegra), nullable=False)
     padrao: Mapped[str] = mapped_column(String(255), nullable=False)
     conta_destino_id: Mapped[int] = mapped_column(Integer, ForeignKey("planos_contas.id"), nullable=False)
@@ -125,22 +120,13 @@ class RegraClassificacao(Base):
     cliente: Mapped["Cliente"] = relationship(back_populates="regras")
     conta_destino: Mapped["PlanoContas"] = relationship(back_populates="regras")
 
-    __table_args__ = (
-        Index("idx_regras_cliente_ativo", "cliente_id", "ativo"),
-    )
-
 
 class LogAuditoria(Base):
     __tablename__ = "logs_auditoria"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    transacao_id: Mapped[int] = mapped_column(Integer, ForeignKey("transacoes.id"), nullable=False)
+    transacao_id: Mapped[int] = mapped_column(Integer, ForeignKey("transacoes.id"), nullable=False, index=True)
     acao: Mapped[str] = mapped_column(String(100), nullable=False)
     detalhes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     usuario: Mapped[str] = mapped_column(String(100), default="sistema")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-    __table_args__ = (
-        Index("idx_audit_transacao", "transacao_id"),
-        Index("idx_audit_created_at", "created_at"),
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)

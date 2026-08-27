@@ -1,4 +1,4 @@
-"""Motor de Regras Contábeis com execução em lote (Batch), cache em memória e checkpoints."""
+"""Motor de Regras Contábeis com suporte a Lote (Batch) e Classificação Unitária com compatibilidade."""
 
 import re
 from decimal import Decimal
@@ -7,11 +7,10 @@ from sqlalchemy.orm import Session
 
 from backend.app.models.entities import (
     Transacao, RegraClassificacao, StatusRevisao, 
-    OrigemClassificacao, CriterioRegra, TipoMovimento
+    OrigemClassificacao, CriterioRegra
 )
 from backend.app.repositories.regra_repository import RegraRepository
 from backend.app.repositories.plano_contas_repository import PlanoContasRepository
-from backend.app.core.logging import logger
 
 
 class RulesEngineService:
@@ -23,6 +22,11 @@ class RulesEngineService:
     def _normalize(self, text: str) -> str:
         return " ".join(text.upper().split())
 
+    def classify_transaction(self, tx: Transacao) -> Transacao:
+        """Classifica uma transação individual mantendo compatibilidade com métodos legados."""
+        self.classify_batch(tx.cliente_id, [tx])
+        return tx
+
     def classify_batch(
         self, 
         cliente_id: int, 
@@ -33,11 +37,9 @@ class RulesEngineService:
         if not transacoes:
             return []
 
-        # 1. Carregar todas as regras ativas e o plano de contas em uma única query
         regras_ativas = self.regra_repo.list_by_client(cliente_id)
         plano_contas = self.plano_repo.list_by_cliente(cliente_id)
         
-        # Mapeamento semântico por palavras-chave
         contas_por_termo = {}
         for c in plano_contas:
             contas_por_termo[self._normalize(c.descricao)] = c.id
@@ -49,7 +51,7 @@ class RulesEngineService:
             desc_norm = self._normalize(tx.descricao_banco)
             classificado = False
 
-            # Camada 1: Regras do Cliente (CNPJ / Termo Exato / Conforme)
+            # Camada 1: Regras do Cliente
             for regra in regras_ativas:
                 padrao_norm = self._normalize(regra.padrao)
                 if regra.criterio == CriterioRegra.CNPJ and padrao_norm in desc_norm:
@@ -74,7 +76,7 @@ class RulesEngineService:
                     classificado = True
                     break
 
-            # Camada 2: Regras Contábeis Semânticas por Termos Globais
+            # Camada 2: Regras Contábeis Globais
             if not classificado:
                 if any(k in desc_norm for k in ["IOF", "TARIFA", "MANUTENCAO CONTA", "TAXA"]):
                     for desc, cid in contas_por_termo.items():
@@ -96,11 +98,9 @@ class RulesEngineService:
                             classificado = True
                             break
 
-            # Se não classificado, permanece pendente
             if not classificado:
                 tx.status_revisao = StatusRevisao.PENDENTE
 
-            # Checkpoint intermediário para evitar perda de estado em lotes gigantes
             if idx % checkpoint_size == 0:
                 self.db.commit()
 
