@@ -1,153 +1,111 @@
-"""Motor de Classificação em Cascata (Camadas 1 e 2)."""
+"""Motor de Regras Contábeis com execução em lote (Batch), cache em memória e checkpoints."""
 
 import re
-from typing import Optional, Tuple
 from decimal import Decimal
+from typing import List, Optional, Callable
 from sqlalchemy.orm import Session
 
 from backend.app.models.entities import (
-    Transacao,
-    RegraClassificacao,
-    OrigemClassificacao,
-    StatusRevisao,
-    CriterioRegra,
-    PlanoContas,
-    TipoMovimento
+    Transacao, RegraClassificacao, StatusRevisao, 
+    OrigemClassificacao, CriterioRegra, TipoMovimento
 )
-from backend.app.repositories.rule_repository import RuleRepository
-from backend.app.repositories.transaction_repository import TransactionRepository
-
-
-class ClassificationResult:
-    def __init__(
-        self,
-        conta_id: Optional[int],
-        origem: Optional[OrigemClassificacao],
-        confianca: Decimal,
-        justificativa: str
-    ):
-        self.conta_id = conta_id
-        self.origem = origem
-        self.confianca = confianca
-        self.justificativa = justificativa
+from backend.app.repositories.regra_repository import RegraRepository
+from backend.app.repositories.plano_contas_repository import PlanoContasRepository
+from backend.app.core.logging import logger
 
 
 class RulesEngineService:
-    """Aplica regras exatas (Camada 1) e regras de negócio contábil (Camada 2)."""
-
     def __init__(self, db: Session):
         self.db = db
-        self.rule_repo = RuleRepository(db)
-        self.tx_repo = TransactionRepository(db)
+        self.regra_repo = RegraRepository(db)
+        self.plano_repo = PlanoContasRepository(db)
 
-    def extract_document(self, text: str) -> Optional[str]:
-        """Extrai CNPJ ou CPF presente no texto da transação."""
-        cnpj_match = re.search(r"\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b", text)
-        if cnpj_match:
-            return cnpj_match.group(0)
+    def _normalize(self, text: str) -> str:
+        return " ".join(text.upper().split())
 
-        cpf_match = re.search(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b", text)
-        if cpf_match:
-            return cpf_match.group(0)
+    def classify_batch(
+        self, 
+        cliente_id: int, 
+        transacoes: List[Transacao],
+        progress_callback: Optional[Callable[[int, int], None]] = None
+    ) -> List[Transacao]:
+        """Classifica uma lista de transações com regras pré-carregadas na memória."""
+        if not transacoes:
+            return []
 
-        return None
+        # 1. Carregar todas as regras ativas e o plano de contas em uma única query
+        regras_ativas = self.regra_repo.list_by_client(cliente_id)
+        plano_contas = self.plano_repo.list_by_cliente(cliente_id)
+        
+        # Mapeamento semântico por palavras-chave
+        contas_por_termo = {}
+        for c in plano_contas:
+            contas_por_termo[self._normalize(c.descricao)] = c.id
 
-    def match_exact_rules(self, cliente_id: int, descricao: str) -> Optional[ClassificationResult]:
-        """Camada 1: Correspondência exata por CNPJ/CPF ou substring de histórico cadastrado."""
-        rule = self.rule_repo.find_matching_rule(cliente_id, descricao)
-        if rule:
-            return ClassificationResult(
-                conta_id=rule.conta_id,
-                origem=OrigemClassificacao.REGRA_EXATA,
-                confianca=Decimal("1.00"),
-                justificativa=f"Correspondência exata encontrada com critério: '{rule.valor_criterio}'"
-            )
-        return None
+        total = len(transacoes)
+        checkpoint_size = 100
 
-    def match_accounting_rules(
-        self, cliente_id: int, descricao: str, tipo_movimento: TipoMovimento
-    ) -> Optional[ClassificationResult]:
-        """Camada 2: Regras contábeis padrão por termos bancários e radicais contábeis."""
-        desc = descricao.upper()
+        for idx, tx in enumerate(transacoes, start=1):
+            desc_norm = self._normalize(tx.descricao_banco)
+            classificado = False
 
-        patterns = [
-            (r"\b(TAR|TARIFA|TARIFAS)\b", "Despesa", "Tarif"),
-            (r"\b(IOF)\b", "Despesa", "IOF"),
-            (r"\b(REND|RENDIMENTO|RENDIMENTOS)\b", "Receita", "Rend"),
-            (r"\b(RESGATE)\b", "Ativo", "Aplica"),
-            (r"\b(GPS|INSS)\b", "Passivo", "INSS"),
-            (r"\b(DARF|IMPOSTO|IMPOSTOS)\b", "Passivo", "Impost"),
-            (r"\b(FGTS)\b", "Passivo", "FGTS"),
-            (r"\b(SALARIO|SALARIOS|FOLHA)\b", "Despesa", "Salár"),
-        ]
+            # Camada 1: Regras do Cliente (CNPJ / Termo Exato / Conforme)
+            for regra in regras_ativas:
+                padrao_norm = self._normalize(regra.padrao)
+                if regra.criterio == CriterioRegra.CNPJ and padrao_norm in desc_norm:
+                    tx.conta_classificada_id = regra.conta_destino_id
+                    tx.origem_classificacao = OrigemClassificacao.REGRA_EXATA
+                    tx.confianca = Decimal("1.00")
+                    tx.status_revisao = StatusRevisao.CONFIRMADO
+                    classificado = True
+                    break
+                elif regra.criterio == CriterioRegra.TERMO_EXATO and padrao_norm == desc_norm:
+                    tx.conta_classificada_id = regra.conta_destino_id
+                    tx.origem_classificacao = OrigemClassificacao.REGRA_EXATA
+                    tx.confianca = Decimal("1.00")
+                    tx.status_revisao = StatusRevisao.CONFIRMADO
+                    classificado = True
+                    break
+                elif regra.criterio == CriterioRegra.CONFORME and padrao_norm in desc_norm:
+                    tx.conta_classificada_id = regra.conta_destino_id
+                    tx.origem_classificacao = OrigemClassificacao.REGRA_PADRAO
+                    tx.confianca = Decimal("0.90")
+                    tx.status_revisao = StatusRevisao.CONFIRMADO
+                    classificado = True
+                    break
 
-        for regex_pattern, tipo_esperado, search_stem in patterns:
-            if re.search(regex_pattern, desc):
-                conta = (
-                    self.db.query(PlanoContas)
-                    .filter(
-                        PlanoContas.cliente_id == cliente_id,
-                        PlanoContas.tipo.ilike(f"%{tipo_esperado}%"),
-                        PlanoContas.descricao.ilike(f"%{search_stem}%")
-                    )
-                    .first()
-                )
-                if conta:
-                    return ClassificationResult(
-                        conta_id=conta.id,
-                        origem=OrigemClassificacao.REGRA_CONTABIL,
-                        confianca=Decimal("0.90"),
-                        justificativa=f"Regra contábil aplicada via padrão '{regex_pattern}' -> Conta '{conta.descricao}'"
-                    )
+            # Camada 2: Regras Contábeis Semânticas por Termos Globais
+            if not classificado:
+                if any(k in desc_norm for k in ["IOF", "TARIFA", "MANUTENCAO CONTA", "TAXA"]):
+                    for desc, cid in contas_por_termo.items():
+                        if "DESPESAS BANCARIAS" in desc or "TARIFA" in desc:
+                            tx.conta_classificada_id = cid
+                            tx.origem_classificacao = OrigemClassificacao.REGRA_PADRAO
+                            tx.confianca = Decimal("0.85")
+                            tx.status_revisao = StatusRevisao.CONFIRMADO
+                            classificado = True
+                            break
 
-        return None
+                elif any(k in desc_norm for k in ["RENDIMENTO", "APLICACAO", "RESGATE", "JUROS S/ CAPITAL"]):
+                    for desc, cid in contas_por_termo.items():
+                        if "RECEITA FINANCEIRA" in desc or "RENDIMENTO" in desc:
+                            tx.conta_classificada_id = cid
+                            tx.origem_classificacao = OrigemClassificacao.REGRA_PADRAO
+                            tx.confianca = Decimal("0.85")
+                            tx.status_revisao = StatusRevisao.CONFIRMADO
+                            classificado = True
+                            break
 
-    def classify_transaction(self, transacao: Transacao) -> Transacao:
-        """Executa a cascata de regras sobre uma única transação."""
-        result = self.match_exact_rules(transacao.cliente_id, transacao.descricao_banco)
+            # Se não classificado, permanece pendente
+            if not classificado:
+                tx.status_revisao = StatusRevisao.PENDENTE
 
-        if not result:
-            result = self.match_accounting_rules(
-                transacao.cliente_id, transacao.descricao_banco, transacao.tipo_movimento
-            )
+            # Checkpoint intermediário para evitar perda de estado em lotes gigantes
+            if idx % checkpoint_size == 0:
+                self.db.commit()
 
-        if result:
-            transacao.conta_classificada_id = result.conta_id
-            transacao.origem_classificacao = result.origem
-            transacao.confianca = result.confianca
-            transacao.status_revisao = StatusRevisao.CONFIRMADO
-        else:
-            transacao.conta_classificada_id = None
-            transacao.origem_classificacao = None
-            transacao.confianca = Decimal("0.00")
-            transacao.status_revisao = StatusRevisao.PENDENTE
+            if progress_callback:
+                progress_callback(idx, total)
 
         self.db.commit()
-        self.db.refresh(transacao)
-        return transacao
-
-    def confirm_and_learn_rule(
-        self, transacao_id: int, conta_id: int, criterio_texto: Optional[str] = None
-    ) -> RegraClassificacao:
-        """Aprende com a correção/confirmação humana, gerando uma regra da Camada 1."""
-        tx = self.tx_repo.get_by_id(transacao_id)
-        if not tx:
-            raise ValueError(f"Transação {transacao_id} não encontrada.")
-
-        termo = criterio_texto or tx.descricao_banco.strip()
-
-        nova_regra = RegraClassificacao(
-            cliente_id=tx.cliente_id,
-            criterio=CriterioRegra.TEXTO,
-            valor_criterio=termo,
-            conta_id=conta_id
-        )
-        self.rule_repo.create(nova_regra)
-
-        tx.conta_classificada_id = conta_id
-        tx.origem_classificacao = OrigemClassificacao.MANUAL
-        tx.confianca = Decimal("1.00")
-        tx.status_revisao = StatusRevisao.REVISADO
-        self.db.commit()
-
-        return nova_regra
+        return transacoes

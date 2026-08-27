@@ -1,75 +1,72 @@
-"""Serviço de Ingestão de Extratos com deduplicação via hash SHA-256."""
+"""Serviço de Ingestão de Extratos com persistência em lote e deduplicação estrita."""
 
 import hashlib
-from typing import Tuple, List
+from typing import List, Tuple
 from sqlalchemy.orm import Session
 
-from backend.app.models.entities import ExtratoImportado, Transacao, StatusRevisao
-from backend.app.repositories.statement_repository import StatementRepository
-from backend.app.repositories.transaction_repository import TransactionRepository
-from backend.app.services.statement_dto import StatementBatch
-from backend.app.services.parsers import OfxParser, CsvParser, PdfParser, BaseParser
+from backend.app.models.entities import Extrato, Transacao
+from backend.app.repositories.extrato_repository import ExtratoRepository
+from backend.app.services.parsers import OFXParser, CSVParser, PDFParser
+from backend.app.services.parser_dto import StatementParseResult
 
 
 class StatementIngestionService:
-    """Orquestra leitura, hash, deduplicação e persistência inicial de transações."""
-
     def __init__(self, db: Session):
         self.db = db
-        self.statement_repo = StatementRepository(db)
-        self.transaction_repo = TransactionRepository(db)
-        self.parsers = {
-            "ofx": OfxParser(),
-            "csv": CsvParser(),
-            "pdf": PdfParser()
-        }
+        self.extrato_repo = ExtratoRepository(db)
 
-    def compute_file_hash(self, file_content: bytes) -> str:
-        """Gera hash SHA-256 seguro para garantir idempotência da importação."""
-        return hashlib.sha256(file_content).hexdigest()
+    def compute_sha256(self, content: bytes) -> str:
+        return hashlib.sha256(content).hexdigest()
 
-    def get_parser_for_filename(self, filename: str) -> BaseParser:
-        ext = filename.lower().split(".")[-1]
-        if ext not in self.parsers:
-            raise ValueError(f"Extensão de arquivo '.{ext}' não é suportada. Use OFX, CSV ou PDF.")
-        return self.parsers[ext]
+    def ingest_statement(self, cliente_id: int, filename: str, content: bytes) -> Tuple[Extrato, List[Transacao]]:
+        file_hash = self.compute_sha256(content)
 
-    def ingest_statement(
-        self, cliente_id: int, filename: str, content_bytes: bytes
-    ) -> Tuple[ExtratoImportado, List[Transacao]]:
-        """Processa arquivo, valida duplicatas e salva transações com status PENDENTE."""
-        file_hash = self.compute_file_hash(content_bytes)
+        existing_extrato = self.extrato_repo.get_by_hash(file_hash)
+        if existing_extrato:
+            raise ValueError(f"O extrato '{filename}' já foi importado anteriormente (Deduplicação SHA-256 ativa).")
 
-        if self.statement_repo.exists_hash(cliente_id, file_hash):
-            raise ValueError(f"O extrato '{filename}' já foi importado anteriormente para este cliente.")
+        lower_fn = filename.lower()
+        if lower_fn.endswith(".ofx"):
+            parse_result: StatementParseResult = OFXParser().parse(content)
+        elif lower_fn.endswith(".csv"):
+            parse_result = CSVParser().parse(content)
+        elif lower_fn.endswith(".pdf"):
+            parse_result = PDFParser().parse(content)
+        else:
+            raise ValueError("Formato não suportado. Utilize arquivos .ofx, .csv ou .pdf.")
 
-        parser = self.get_parser_for_filename(filename)
-        parsed_items = parser.parse(content_bytes, filename)
+        if not parse_result.transacoes:
+            raise ValueError("Nenhuma transação válida encontrada no arquivo fornecido.")
 
-        if not parsed_items:
-            raise ValueError(f"Nenhuma transação válida foi encontrada no arquivo '{filename}'.")
-
-        # 1. Registrar extrato importado
-        extrato = ExtratoImportado(
+        # Cria cabeçalho do extrato
+        extrato = Extrato(
             cliente_id=cliente_id,
             nome_arquivo=filename,
-            hash_arquivo=file_hash
+            hash_sha256=file_hash,
+            total_transacoes=len(parse_result.transacoes)
         )
-        self.statement_repo.create(extrato)
+        self.db.add(extrato)
+        self.db.flush()  # Obtém extrato.id sem fechar a transação
 
-        # 2. Persistir transações no banco
-        persisted_transactions: List[Transacao] = []
-        for item in parsed_items:
+        # Inserção em lote (Batch Insert)
+        tx_entities: List[Transacao] = []
+        for item in parse_result.transacoes:
             tx = Transacao(
                 cliente_id=cliente_id,
+                extrato_id=extrato.id,
                 data=item.data,
                 descricao_banco=item.descricao,
+                documento=item.documento,
                 valor=item.valor,
-                tipo_movimento=item.tipo_movimento,
-                confianca=item.confianca_extracao,
-                status_revisao=StatusRevisao.PENDENTE
+                tipo_movimento=item.tipo_movimento
             )
-            self.transaction_repo.create(tx)
-            persisted_transactions.append(tx)
+            tx_entities.append(tx)
 
-        return extrato, persisted_transactions
+        self.db.add_all(tx_entities)
+        self.db.commit()
+
+        # Recarrega IDs com flush
+        for tx in tx_entities:
+            self.db.refresh(tx)
+
+        return extrato, tx_entities
